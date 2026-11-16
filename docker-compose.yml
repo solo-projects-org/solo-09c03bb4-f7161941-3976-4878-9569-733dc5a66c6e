@@ -1,0 +1,66 @@
+# 海洋数仓浮标观测包接收服务 —— 双实例编排
+#
+# 两个实例（app1 / app2）共享同一个命名卷 data：
+#   - SQLite（WAL 模式）支持多进程一写多读；
+#   - 暂存与成品文件、flock 锁文件均在共享卷上，跨实例互斥与对账有效。
+# 实例前置 nginx 做轮询负载均衡，对外统一入口与 Swagger。
+#
+# 启动：docker compose up -d --build
+# 入口：http://localhost:8080/  （Swagger: /docs）
+
+services:
+  app1:
+    build: .
+    image: obs-buoy-receiver:latest
+    environment:
+      OBS_DATA_DIR: /data
+      OBS_QUOTA_BYTES: ${OBS_QUOTA_BYTES:-1073741824}
+      OBS_INSTANCE_ID: instance-1
+      OBS_RECONCILE_INTERVAL: "30"
+    volumes:
+      - obs-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app2:
+    image: obs-buoy-receiver:latest
+    build: .
+    environment:
+      OBS_DATA_DIR: /data
+      OBS_QUOTA_BYTES: ${OBS_QUOTA_BYTES:-1073741824}
+      OBS_INSTANCE_ID: instance-2
+      OBS_RECONCILE_INTERVAL: "30"
+    volumes:
+      - obs-data:/data
+    restart: unless-stopped
+    depends_on:
+      app1:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  gateway:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - app1
+      - app2
+    restart: unless-stopped
+
+volumes:
+  obs-data:
+    driver: local
