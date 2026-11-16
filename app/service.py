@@ -1,4 +1,12 @@
-"""接收流程编排：声明 → 上传 → 校验 → 发布，全部崩溃安全。"""
+"""接收流程编排：声明 → 上传 → 校验 → 发布，全部崩溃安全。
+
+v2 增加原件完整性交接：
+- 磁盘共享原件被改坏（长度/SHA-256 不符）时，blob 与全部关联接收进入
+  QUARANTINED（隔离、不可供数），下载拒绝并给出补传原因；
+- 任一关联接收按原声明补传，通过长度、SHA-256 与 Parquet 站日三关后，
+  原子替换坏件并一次性恢复全部关联接收，同内容仍只占一份额度；
+- 所有状态变更在全局 flock + 写事务内完成，双实例交错也不会误标/误删/重复计额。
+"""
 
 from __future__ import annotations
 
@@ -14,6 +22,7 @@ from .config import Settings
 from .db import Database
 from .errors import (
     AlreadyFinalized,
+    ArtifactQuarantined,
     ContentMismatch,
     DeclarationConflict,
     InvalidPackage,
@@ -30,14 +39,20 @@ from .storage import (
     current_usage,
     global_lock,
     hardlink_or_copy,
+    restore_blob_healthy,
     safe_remove,
     staging_path,
     try_receipt_lock,
+    verify_blob_bytes,
 )
 from .validation import validate_parquet
 
 # 所有阻塞型 SQLite/文件/Parquet 操作共用的线程池，保证事件循环不被拖住
 _io_pool: ThreadPoolExecutor | None = None
+
+_UPLOADING = "UPLOADING"
+_PUBLISHED = "PUBLISHED"
+_QUARANTINED = "QUARANTINED"
 
 
 def _get_io_pool() -> ThreadPoolExecutor:
@@ -59,13 +74,20 @@ async def _offload(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_get_io_pool(), partial(func, *args, **kwargs))
 
-# 声明中允许的状态流转集合
-_UPLOADING = "UPLOADING"
-_PUBLISHED = "PUBLISHED"
-
 
 def _row_to_dict(row: object) -> dict:
     return dict(row)  # type: ignore[arg-type]
+
+
+def _set_publishing(db: Database, receipt_id: str, value: int) -> None:
+    """登记/清除发布临界标记（与状态同库，跨实例对账可见）。"""
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE receipts SET publishing = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE receipt_id = ?",
+            (value, receipt_id),
+        )
 
 
 def declare_receipt(settings: Settings, db: Database, decl: DeclarationIn) -> dict:
@@ -191,13 +213,20 @@ def _finish_upload(
 
 
 def _publish(settings: Settings, db: Database, receipt: dict) -> dict:
-    """校验 Parquet 并发布为内容寻址成品（全局锁，跨实例互斥）。"""
+    """校验 Parquet 并发布为内容寻址成品（全局锁，跨实例互斥）。
+
+    三种情形：
+    1. 全新内容：配额核算后硬链接发布、登记 blob；
+    2. 已存在健康 blob：增引用（隔离/待补传接收不重复增 ref_count）；
+    3. 已登记 blob 但磁盘损坏/隔离/缺件：用本次通过三关的暂存原子替换坏件，
+       解除隔离并恢复全部关联接收，同内容不新增物理占用、不重复计额。
+    """
     receipt_id = receipt["receipt_id"]
     part = staging_path(settings, receipt_id)
     if not os.path.isfile(part):
         raise UploadNotComplete(f"接收 {receipt_id} 的暂存文件不存在，请重新上传")
 
-    # 先做内容校验；失败时成品区无任何变动，接收保持 UPLOADING 可重传
+    # 先做内容校验（站号/站日逐行）；失败时成品区无任何变动，接收保持可重传
     result = validate_parquet(
         part,
         station_id=receipt["station_id"],
@@ -209,6 +238,10 @@ def _publish(settings: Settings, db: Database, receipt: dict) -> dict:
             row = conn.execute(
                 "SELECT * FROM receipts WHERE receipt_id = ?", (receipt_id,)
             ).fetchone()
+            if row is None:
+                # 等待全局锁期间该接收被并发删除：无可发布对象，清理本会话暂存
+                safe_remove(part)
+                raise ReceiptNotFound(f"接收号 {receipt_id} 已被删除，发布中止")
             if row["state"] == _PUBLISHED:
                 return _row_to_dict(row)
             sha = row["declared_sha256"]
@@ -216,6 +249,18 @@ def _publish(settings: Settings, db: Database, receipt: dict) -> dict:
             blob_row = conn.execute(
                 "SELECT * FROM blobs WHERE sha256 = ?", (sha,)
             ).fetchone()
+            prior_state = row["state"]
+
+            def _link_or_replace(dst: str) -> None:
+                # 暂存可能在取全局锁期间被并发删除流程回收：转成可重试业务错误，
+                # 绝不向上抛裸 FileNotFoundError（HTTP 500）
+                if not os.path.isfile(part):
+                    raise UploadNotComplete(
+                        f"接收 {receipt_id} 的暂存文件在发布前消失（可能被并发删除），"
+                        "请重新上传"
+                    )
+                hardlink_or_copy(part, dst)
+
             if blob_row is None:
                 # 新内容：发布前按成品口径核算（blob 已用 + 本包 ≤ 额度）。
                 # 暂存在事务提交后即删除，不与成品叠加；硬链接同卷不额外占物理空间。
@@ -230,24 +275,58 @@ def _publish(settings: Settings, db: Database, receipt: dict) -> dict:
                         status_code=507,
                     )
                 # 硬链接进成品区（同卷不额外占物理空间，逻辑上计入 blob 额度）
-                hardlink_or_copy(part, target)
+                _link_or_replace(target)
+                st = os.stat(target)
                 conn.execute(
-                    "INSERT INTO blobs(sha256, size, ref_count) VALUES (?, ?, 1)",
-                    (sha, row["declared_size"]),
+                    "INSERT INTO blobs(sha256, size, ref_count, quarantined, "
+                    "last_size, last_mtime_ns, last_verified_at) "
+                    "VALUES (?, ?, 1, 0, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                    (sha, row["declared_size"], st.st_size, st.st_mtime_ns),
                 )
             else:
                 if not os.path.isfile(target):
-                    # 磁盘文件丢失但账本仍在：用本暂存重建，避免缺件成品
-                    hardlink_or_copy(part, target)
-                conn.execute(
-                    "UPDATE blobs SET ref_count = ref_count + 1 WHERE sha256 = ?",
-                    (sha,),
-                )
+                    needs_replace = True
+                else:
+                    needs_replace = (
+                        blob_row["quarantined"]
+                        or os.path.getsize(target) != row["declared_size"]
+                    )
+                if needs_replace:
+                    # 补传交接：正确原包原子替换坏件/缺件，物理占用不变（同长度）
+                    _link_or_replace(target)
+                    st = os.stat(target)
+                    restore_blob_healthy(
+                        conn, sha, size=st.st_size,
+                        mtime_ns=st.st_mtime_ns, row_count=result.row_count,
+                    )
+                    # 本接收若原本是 UPLOADING（缺件回退场景），仍需补一个引用；
+                    # 原本 QUARANTINED 的引用一直保留，ref_count 已正确，不重复加。
+                    if prior_state == _UPLOADING:
+                        conn.execute(
+                            "UPDATE blobs SET ref_count = ref_count + 1 "
+                            "WHERE sha256 = ?",
+                            (sha,),
+                        )
+                else:
+                    if prior_state == _UPLOADING:
+                        conn.execute(
+                            "UPDATE blobs SET ref_count = ref_count + 1 "
+                            "WHERE sha256 = ?",
+                            (sha,),
+                        )
             conn.execute(
-                "UPDATE receipts SET state = 'PUBLISHED', blob_sha256 = ?, row_count = ?, "
-                "last_error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "UPDATE receipts SET state = 'PUBLISHED', blob_sha256 = ?, "
+                "row_count = ?, last_error = NULL, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
                 "WHERE receipt_id = ?",
                 (sha, result.row_count, receipt_id),
+            )
+            # 兜底：按真实关联接收重算 ref_count，杜绝任何交错造成的重复计额
+            conn.execute(
+                "UPDATE blobs SET ref_count = ("
+                "SELECT COUNT(*) FROM receipts WHERE blob_sha256 = ? "
+                "AND state IN ('PUBLISHED', 'QUARANTINED')) WHERE sha256 = ?",
+                (sha, sha),
             )
             published = _row_to_dict(
                 conn.execute(
@@ -267,7 +346,7 @@ def _stream_to_staging(
     """线程池中执行的纯同步落盘：截断重写、同步刷盘、计算摘要。
 
     写入前做实际配额核算（按真实字节，而非声明预留），空间不足明确拒收。
-    若内容已存在于成品区（同内容重发），硬链接发布不产生新物理占用，
+    若内容已存在于成品区（同内容重发/隔离件补传），硬链接发布不产生新物理占用，
     因此跳过暂存配额检查。
     """
     total_size = sum(len(c) for c in chunks)
@@ -308,6 +387,7 @@ async def upload_package(
 
     网络读取走 async 迭代不阻塞事件循环；文件、SQLite、Parquet 等同步重活
     全部进入 I/O 线程池，因此慢上传期间其他包的接收与查询照常处理。
+    QUARANTINED（隔离待补传）与 UPLOADING 一样允许补传；PUBLISHED 走幂等分支。
     """
     receipt = await _offload(get_receipt, db, receipt_id)
     if receipt["state"] == _PUBLISHED:
@@ -349,34 +429,89 @@ async def upload_package(
             await _offload(_record_failure, db, receipt_id, "上传中断或超出声明长度，请重新上传")
             raise
 
+        # 落盘前置发布临界标记：消除“已落盘但未登记”的无保护窗口，
+        # 使并发对账在整个落盘+发布期间都不会把该暂存当孤儿清理。
+        await _offload(_set_publishing, db, receipt_id, 1)
         try:
-            _part, total_written, digest = await _offload(
-                _stream_to_staging, settings, db, receipt, chunks
-            )
-        except ContentMismatch:
-            await _offload(_record_failure, db, receipt_id, "上传超出声明长度，请重新上传")
-            raise
-        except ObsError:
-            # 配额不足：没有落盘，直接向上抛 507
-            raise
+            # 至多重试一次：极端交错下暂存可能在标记生效的同一瞬间被上一轮对账
+            # 判定，重新落盘即可自愈，不向调用方返回 409/500。
+            for attempt in (1, 2):
+                try:
+                    _part, total_written, digest = await _offload(
+                        _stream_to_staging, settings, db, receipt, chunks
+                    )
+                except ContentMismatch:
+                    await _offload(
+                        _record_failure, db, receipt_id, "上传超出声明长度，请重新上传"
+                    )
+                    raise
+                except ObsError:
+                    # 配额不足：没有落盘，直接向上抛 507
+                    raise
 
-        try:
-            receipt = await _offload(
-                _finish_upload, settings, db,
-                receipt_id=receipt_id, total_bytes=total_written, digest=digest,
-            )
-            return await _offload(_publish, settings, db, receipt)
+                receipt = await _offload(
+                    _finish_upload, settings, db,
+                    receipt_id=receipt_id, total_bytes=total_written, digest=digest,
+                )
+                try:
+                    return await _offload(_publish, settings, db, receipt)
+                except UploadNotComplete:
+                    # 暂存在发布前消失（与并发删除/对账交错）：尚有一次重试机会
+                    if attempt == 2:
+                        raise
         except (InvalidPackage, ContentMismatch) as exc:
-            # 校验失败：不产生任何可下载成品，记录原因，接收保持可重传。
-            # 长度/摘要进度由 _finish_upload 已登记的保留，仅补充失败说明。
+            # 校验失败：不产生任何可下载成品，记录原因，接收保持可重传/待补传。
+            # 隔离接收的 QUARANTINED 状态与 blob 隔离标记保持不变，等待合格补传。
             await _offload(_record_publish_failure, db, receipt_id, exc.message)
             raise
+        finally:
+            # 发布结束（成功或失败）即退出临界态；成功时暂存已删，失败时保留可重传
+            await _offload(_set_publishing, db, receipt_id, 0)
     finally:
         await _offload(lock.release)
 
 
+def prepare_download(settings: Settings, db: Database, receipt_id: str) -> dict:
+    """下载前准备：核验原件字节，返回最新接收行；坏件直接抛 ArtifactQuarantined。"""
+    row = get_receipt(db, receipt_id)
+    if row["state"] != _PUBLISHED or not row["blob_sha256"]:
+        if row["state"] == _QUARANTINED:
+            raise ArtifactQuarantined(
+                f"接收 {receipt_id} 的共享原件已隔离、暂停供数，"
+                f"请按原声明补传正确原包：{row['last_error']}"
+            )
+        raise ArtifactQuarantined(
+            f"接收 {receipt_id} 尚未发布成功，无可下载成品",
+        )
+    # 惰性核验：长度/SHA-256 不符会在此隔离并抛错，绝不返回带原摘要的坏字节
+    verify_blob_bytes(settings, db, row["blob_sha256"])
+    # 核验可能改写状态，且期间接收可能被并发删除：重新读一次并兜底
+    latest = db.query_one(
+        "SELECT * FROM receipts WHERE receipt_id = ?", (receipt_id,)
+    )
+    if latest is None:
+        raise ReceiptNotFound(f"接收号 {receipt_id} 已被删除，无法下载")
+    latest = dict(latest)
+    if latest["state"] != _PUBLISHED or not latest["blob_sha256"]:
+        raise ArtifactQuarantined(
+            f"接收 {receipt_id} 当前无可下载成品：{latest.get('last_error') or '状态已变更'}"
+        )
+    return latest
+
+
 def _record_failure(db: Database, receipt_id: str, message: str) -> None:
     with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT state FROM receipts WHERE receipt_id = ?", (receipt_id,)
+        ).fetchone()
+        # 隔离待补传的接收不因一次失败补传而改变状态/解除隔离
+        if row is not None and row["state"] == _QUARANTINED:
+            conn.execute(
+                "UPDATE receipts SET last_error = ?, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE receipt_id = ?",
+                (f"补传未通过：{message}", receipt_id),
+            )
+            return
         conn.execute(
             "UPDATE receipts SET bytes_received = 0, actual_sha256 = NULL, last_error = ?, "
             "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE receipt_id = ?",
@@ -386,10 +521,14 @@ def _record_failure(db: Database, receipt_id: str, message: str) -> None:
 
 def _record_publish_failure(db: Database, receipt_id: str, message: str) -> None:
     with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT state FROM receipts WHERE receipt_id = ?", (receipt_id,)
+        ).fetchone()
+        prefix = "补传原包校验失败" if (row and row["state"] == _QUARANTINED) else "原包校验失败"
         conn.execute(
             "UPDATE receipts SET last_error = ?, "
             "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE receipt_id = ?",
-            (f"原包校验失败：{message}", receipt_id),
+            (f"{prefix}：{message}", receipt_id),
         )
 
 
@@ -404,6 +543,11 @@ def abort_receipt(settings: Settings, db: Database, receipt_id: str) -> dict:
                 raise ReceiptNotFound(f"接收号 {receipt_id} 不存在")
             if row["state"] == _PUBLISHED:
                 raise AlreadyFinalized(f"接收 {receipt_id} 已发布，不能中止")
+            if row["state"] == _QUARANTINED:
+                # 隔离接收仍被共享原件引用，不能中止；只能补传恢复或整体删除
+                raise AlreadyFinalized(
+                    f"接收 {receipt_id} 的原件已隔离，不能中止；请补传正确原包或删除该接收"
+                )
             conn.execute(
                 "UPDATE receipts SET bytes_received = 0, actual_sha256 = NULL, "
                 "last_error = '接收已人工中止，额度已释放', "
@@ -415,7 +559,7 @@ def abort_receipt(settings: Settings, db: Database, receipt_id: str) -> dict:
 
 
 def delete_receipt(settings: Settings, db: Database, receipt_id: str) -> None:
-    """删除接收记录；若为唯一引用则成品 blob 一并回收。"""
+    """删除接收记录；若为唯一引用则成品 blob 一并回收（含隔离坏件）。"""
     with global_lock(settings):
         with try_receipt_lock(settings, receipt_id):
             with db.transaction() as conn:
@@ -424,10 +568,11 @@ def delete_receipt(settings: Settings, db: Database, receipt_id: str) -> None:
                 ).fetchone()
                 if row is None:
                     raise ReceiptNotFound(f"接收号 {receipt_id} 不存在")
-                if row["state"] == _PUBLISHED and row["blob_sha256"]:
+                if row["state"] in (_PUBLISHED, _QUARANTINED) and row["blob_sha256"]:
                     sha = row["blob_sha256"]
                     conn.execute(
-                        "UPDATE blobs SET ref_count = MAX(ref_count - 1, 0) WHERE sha256 = ?",
+                        "UPDATE blobs SET ref_count = MAX(ref_count - 1, 0) "
+                        "WHERE sha256 = ?",
                         (sha,),
                     )
                     blob = conn.execute(

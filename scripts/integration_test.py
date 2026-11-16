@@ -11,6 +11,8 @@
   6. 慢上传期间另一实例仍可接收与查询（不阻塞）
   7. 配额不足 507
   8. 崩溃回收：伪造孤儿暂存后调 /admin/reconcile 被清理
+  9. 原件完整性：等长改坏 → 跨实例隔离、下载 409、关联接收不可供数；
+     任一关联接收补传 → 全部恢复且额度仍一份
 """
 
 from __future__ import annotations
@@ -230,6 +232,63 @@ def main() -> int:
     check("失败记录保持 UPLOADING 可重传",
           states.get("IT-BADLEN") == "UPLOADING"
           and states.get("IT-BADPARQUET") == "UPLOADING", str(states))
+
+    print("== 9. 原件完整性：等长改坏、隔离与补传交接 ==")
+    d9, sha9 = make_parquet("p9.parquet", salt=7.0)
+    rids = ["IT-Q1", "IT-Q2"]
+    for rid in rids:
+        req("PUT", BASE1, f"/receipts/{rid}/declaration", decl(rid, d9, sha9))
+        code, body, _ = req("POST", BASE2, f"/receipts/{rid}/content", d9, raw=True)
+        check(f"{rid} 发布成功", code == 200 and json.loads(body)["state"] == "PUBLISHED")
+
+    blob9 = pathlib.Path(os.environ["OBS_DATA_DIR"]) / "blobs" / sha9[:2] / sha9
+    raw = bytearray(blob9.read_bytes())
+    raw[4] ^= 0xFF  # 等长改坏：长度不变、SHA-256 已变
+    blob9.write_bytes(bytes(raw))
+    os.utime(blob9, None)
+
+    # 9.1 下载惰性核验（不依赖周期对账）：实例1 下载即被拒并隔离
+    code, body, _ = req("GET", BASE1, "/receipts/IT-Q1/download")
+    check("坏件下载被拒且不返回坏字节",
+          code == 409 and json.loads(body)["error"]["code"] == "artifact_quarantined"
+          and body != bytes(raw))
+    # 9.2 另一实例可见隔离状态，全部关联接收不可供数并带补传原因
+    for rid in rids:
+        code, body, _ = req("GET", BASE2, f"/receipts/{rid}")
+        j = json.loads(body)
+        check(f"{rid} 跨实例显示 QUARANTINED 且不可供数",
+              code == 200 and j["state"] == "QUARANTINED" and j["available"] is False
+              and "补传" in (j.get("last_error") or ""), str(j))
+        code, body, _ = req("GET", BASE2, f"/receipts/{rid}/download")
+        check(f"{rid} 坏件下载 409", code == 409)
+    # 健康原件（IT-R1）仍可供数
+    code, body, _ = req("GET", BASE1, "/receipts/IT-R1/download")
+    check("其他健康原件照常供数", code == 200 and body == d1)
+
+    # 9.3 错误补传被拒，隔离保持
+    bad = bytearray(d9)
+    bad[10] ^= 0x01
+    code, body, _ = req("POST", BASE1, "/receipts/IT-Q1/content", bytes(bad), raw=True)
+    check("错误补传 422 且保持隔离",
+          code == 422 and req("GET", BASE1, "/receipts/IT-Q1")[1]
+          and json.loads(req("GET", BASE1, "/receipts/IT-Q1")[1])["state"]
+          == "QUARANTINED")
+
+    # 9.4 任一关联接收（实例2 上的 IT-Q2）按原声明补传正确原包 → 全部恢复
+    code, body, _ = req("POST", BASE2, "/receipts/IT-Q2/content", d9, raw=True)
+    check("正确补传 200", code == 200 and json.loads(body)["state"] == "PUBLISHED",
+          body[:160].decode())
+    for rid in rids:
+        code, body, headers = req("GET", BASE1, f"/receipts/{rid}/download")
+        lh = {k.lower(): v for k, v in headers.items()}
+        check(f"{rid} 恢复供数且字节正确",
+              code == 200 and body == d9 and lh.get("x-sha256") == sha9)
+    # 9.5 同内容仍只占一份额度、物理一份
+    code, body, _ = req("GET", BASE1, "/quota")
+    q = json.loads(body)
+    check("补传后无重复计额", q["quarantined_bytes"] == 0)
+    check("物理成品仍仅一份", blob9.exists()
+          and len(list(blob9.parent.glob(sha9))) == 1)
 
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
     return 1 if FAIL else 0

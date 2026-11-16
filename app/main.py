@@ -33,6 +33,7 @@ from .service import (
     get_quota,
     get_receipt,
     list_receipts,
+    prepare_download,
     shutdown_io_pool,
     upload_package,
 )
@@ -84,7 +85,11 @@ app = FastAPI(
         "- 同号同声明重试沿用原记录，异声明拒绝（409）；\n"
         "- 相同内容跨接收只存一份（内容寻址），不重复占额；\n"
         "- 空间不足返回 507；校验失败无可下载成品；\n"
-        "- 双实例共享存储，崩溃残留由启动与周期对账自动回收。"
+        "- 双实例共享存储，崩溃残留由启动与周期对账自动回收；\n"
+        "- **原件完整性**：下载与对账均核验磁盘真实字节，长度/SHA-256 不符"
+        "（含等长改坏）即隔离共享原件，全部关联接收变为 QUARANTINED 不可供数；"
+        "任一关联接收按原声明补传通过长度、摘要及站日三关后，原子替换坏件并"
+        "恢复全部关联接收下载，同内容只占一份额度。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -164,7 +169,10 @@ async def upload(receipt_id: str, request: Request) -> UploadResult:
     summary="查询接收进度（可按状态/站号过滤）",
 )
 async def list_many(
-    state_filter: str | None = Query(None, alias="state", pattern="^(UPLOADING|PUBLISHED)$"),
+    state_filter: str | None = Query(
+        None, alias="state",
+        pattern="^(UPLOADING|PUBLISHED|QUARANTINED)$",
+    ),
     station_id: str | None = Query(None),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -190,17 +198,12 @@ async def show(receipt_id: str) -> ReceiptOut:
 @app.get(
     "/receipts/{receipt_id}/download",
     tags=["接收"],
-    summary="下载已发布原包（未发布返回 409）",
+    summary="下载已发布原包（先核验字节；未发布/已隔离返回 409 及原因）",
 )
 async def download(receipt_id: str):
-    row = await _offload(get_receipt, db, receipt_id)
-    if row["state"] != "PUBLISHED" or not row["blob_sha256"]:
-        return JSONResponse(
-            status_code=409,
-            content={"error": {"code": "not_published",
-                               "message": f"接收 {receipt_id} 尚未发布成功，无可下载成品",
-                               "last_error": row["last_error"]}},
-        )
+    # 下载前核验磁盘真实字节：等长改坏会在此被隔离并返回 409，
+    # 绝不把带原摘要的坏字节返回给分析员。慢哈希在 I/O 线程池执行。
+    row = await _offload(prepare_download, settings, db, receipt_id)
     path = blob_path(settings, row["blob_sha256"])
     filename = f"{row['station_id']}_{row['obs_date']}_{receipt_id}.parquet"
     return FileResponse(

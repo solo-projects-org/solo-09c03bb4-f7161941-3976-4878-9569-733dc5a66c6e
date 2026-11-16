@@ -56,3 +56,10 @@ class InvalidPackage(ObsError):
 class AlreadyFinalized(ObsError):
     status_code = 409
     code = "already_finalized"
+
+
+class ArtifactQuarantined(ObsError):
+    """原件字节与登记摘要/长度不符被隔离，关联接收不可供数，须补传。"""
+
+    status_code = 409
+    code = "artifact_quarantined"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 _RECEIPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -41,14 +41,29 @@ class ReceiptOut(BaseModel):
     obs_date: str
     declared_size: int
     declared_sha256: str
-    state: str
+    state: str = Field(
+        ...,
+        description="UPLOADING=待上传/可补传；PUBLISHED=已发布可供数；"
+                    "QUARANTINED=原件字节核验失败被隔离，不可供数，须按原声明补传",
+    )
     bytes_received: int
     actual_sha256: str | None
     blob_sha256: str | None
     row_count: int | None
     last_error: str | None
+    publishing: bool = Field(
+        False,
+        description="是否正处于发布临界态（暂存已落盘、正在发布；崩溃后由对账回收）",
+    )
     created_at: str
     updated_at: str
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description="当前是否可向分析员供数（仅 PUBLISHED 且未隔离为 True）"
+    )
+    @property
+    def available(self) -> bool:
+        return self.state == "PUBLISHED"
 
 
 class UploadResult(BaseModel):
@@ -67,9 +82,14 @@ class QuotaOut(BaseModel):
     blob_bytes: int
     staging_bytes: int
     available_bytes: int
+    quarantined_bytes: int = Field(
+        0, description="被隔离原件占用的字节（仍占额度，补传恢复后不再单列）"
+    )
 
 
 class ReconcileOut(BaseModel):
     removed_staging_files: int
     removed_orphan_blobs: int
     reset_receipts: int
+    quarantined_blobs: int = Field(0, description="本次新发现并隔离的坏原件数")
+    restored_receipts: int = Field(0, description="本次随原件核验通过恢复供数的接收数")
